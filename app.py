@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+from pathlib import Path
 from engine import ReconciliationEngine, AIReconciliationExplainer
 
 # Configuration de la page
@@ -19,12 +20,50 @@ st.sidebar.header("📁 Chargement des Flux")
 fo_file = st.sidebar.file_uploader("Fichier Front-Office (CSV)", type="csv")
 bo_file = st.sidebar.file_uploader("Fichier Back-Office (CSV)", type="csv")
 
+if st.sidebar.button("Charger datasets d'exemple"):
+    dataset_dir = Path(__file__).resolve().parent / "dataset"
+    fo_default_path = dataset_dir / "data_front_office.csv"
+    bo_default_path = dataset_dir / "data_back_office.csv"
+
+    if fo_default_path.exists() and bo_default_path.exists():
+        st.session_state["local_dataset_paths"] = (str(fo_default_path), str(bo_default_path))
+        st.sidebar.success("Datasets locaux chargés. Cliquez sur 'Lancer la Réconciliation'.")
+    else:
+        st.sidebar.error(
+            "Fichiers introuvables dans dataset/ (attendus : data_front_office.csv et data_back_office.csv)."
+        )
+
+df_fo = None
+df_bo = None
+current_signature = None
+
 if fo_file and bo_file:
     df_fo = pd.read_csv(fo_file, parse_dates=['Date'])
     df_bo = pd.read_csv(bo_file, parse_dates=['Date'])
+    current_signature = ("upload", fo_file.name, fo_file.size, bo_file.name, bo_file.size)
+elif st.session_state.get("local_dataset_paths"):
+    fo_path_str, bo_path_str = st.session_state["local_dataset_paths"]
+    fo_path = Path(fo_path_str)
+    bo_path = Path(bo_path_str)
+
+    if fo_path.exists() and bo_path.exists():
+        df_fo = pd.read_csv(fo_path, parse_dates=['Date'])
+        df_bo = pd.read_csv(bo_path, parse_dates=['Date'])
+        current_signature = (
+            "local",
+            str(fo_path),
+            fo_path.stat().st_mtime_ns,
+            str(bo_path),
+            bo_path.stat().st_mtime_ns
+        )
+        st.sidebar.caption("Mode démo actif")
+    else:
+        st.sidebar.error("Les fichiers du dossier dataset/ ne sont plus disponibles.")
+        st.session_state.pop("local_dataset_paths", None)
+
+if df_fo is not None and df_bo is not None:
 
     # Réinitialise l'état si les fichiers changent
-    current_signature = (fo_file.name, fo_file.size, bo_file.name, bo_file.size)
     if st.session_state.get("file_signature") != current_signature:
         st.session_state.pop("recon_results", None)
         st.session_state.pop("df_fo", None)
