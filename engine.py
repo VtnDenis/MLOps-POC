@@ -6,6 +6,11 @@ import urllib.request
 import time
 from dotenv import load_dotenv
 import os
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, roc_auc_score
 
 load_dotenv()
 
@@ -14,8 +19,12 @@ class ReconciliationEngine:
     Matching des transactions avec du scoring
     """
     
-    def __init__(self, threshold=0.8):
+    def __init__(self, threshold=0.8, ml_weight=0.35, random_state=42):
         self.threshold = threshold
+        self.ml_weight = ml_weight
+        self.random_state = random_state
+        self.ml_model = None
+        self.ml_metrics = {}
         # On pondère les colonnes car chaque colonne a sa propre importance
         self.weights = {
             'ISIN': 0.40,
@@ -36,9 +45,13 @@ class ReconciliationEngine:
     def _score_price(self, val1, val2, tolerance=0.10):
         """Score basé sur l'écart relatif de prix"""
         diff = abs(val1 - val2)
-        if diff == 0: return 1.0
-        if diff <= tolerance: return 0.8
-        return max(0, 1 - (diff / val1))
+        if diff == 0:
+            return 1.0
+        if diff <= tolerance:
+            return 0.8
+        if val1 == 0:
+            return 0.0
+        return max(0, 1 - (diff / abs(val1)))
 
     def _score_date(self, date1, date2):
         """Score dégressif selon l'écart de jours"""
@@ -62,15 +75,138 @@ class ReconciliationEngine:
         total_score = sum(scores[col] * self.weights[col] for col in self.weights)
         return total_score, scores
 
+    @staticmethod
+    def _safe_ratio_diff(val1, val2):
+        denom = max(abs(float(val1)), 1e-9)
+        return abs(float(val1) - float(val2)) / denom
+
+    def _build_feature_vector(self, row_fo, row_bo, rule_score, scores):
+        date_diff_days = abs((row_fo['Date'] - row_bo['Date']).days)
+        quantity_diff_ratio = self._safe_ratio_diff(row_fo['Quantity'], row_bo['Quantity'])
+        price_diff_ratio = self._safe_ratio_diff(row_fo['Price'], row_bo['Price'])
+
+        return {
+            'isin_match': scores['ISIN'],
+            'qty_exact': scores['Quantity'],
+            'qty_diff_ratio': quantity_diff_ratio,
+            'price_diff_abs': abs(float(row_fo['Price']) - float(row_bo['Price'])),
+            'price_diff_ratio': price_diff_ratio,
+            'counterparty_fuzzy': scores['Counterparty'],
+            'date_diff_days': date_diff_days,
+            'currency_match': 1.0 if str(row_fo.get('Currency', '')).strip() == str(row_bo.get('Currency', '')).strip() else 0.0,
+            'rule_score': rule_score
+        }
+
+    def _is_positive_pair(self, features):
+        """Heuristique de labellisation pour entraîner le modèle ML."""
+        return (
+            features['isin_match'] == 1.0
+            and features['qty_exact'] == 1.0
+            and features['price_diff_ratio'] <= 0.003
+            and features['counterparty_fuzzy'] >= 0.85
+            and features['date_diff_days'] <= 1
+        )
+
+    def _build_training_dataset(self, df_fo, df_bo):
+        X_rows = []
+        y_rows = []
+
+        rng = np.random.default_rng(self.random_state)
+
+        for _, row_fo in df_fo.iterrows():
+            same_isin = df_bo[df_bo['ISIN'] == row_fo['ISIN']]
+            if not same_isin.empty:
+                for _, row_bo in same_isin.iterrows():
+                    rule_score, detail_scores = self.compute_row_score(row_fo, row_bo)
+                    features = self._build_feature_vector(row_fo, row_bo, rule_score, detail_scores)
+                    X_rows.append(features)
+                    y_rows.append(1 if self._is_positive_pair(features) else 0)
+
+            diff_isin = df_bo[df_bo['ISIN'] != row_fo['ISIN']]
+            if not diff_isin.empty:
+                sample_size = min(2, len(diff_isin))
+                sampled_indices = rng.choice(diff_isin.index.to_numpy(), size=sample_size, replace=False)
+                negatives = diff_isin.loc[sampled_indices]
+                for _, row_bo in negatives.iterrows():
+                    rule_score, detail_scores = self.compute_row_score(row_fo, row_bo)
+                    features = self._build_feature_vector(row_fo, row_bo, rule_score, detail_scores)
+                    X_rows.append(features)
+                    y_rows.append(0)
+
+        if not X_rows:
+            return None, None
+
+        X = pd.DataFrame(X_rows)
+        y = pd.Series(y_rows)
+        return X, y
+
+    def train_ml_matcher(self, df_fo, df_bo):
+        """Entraîne un classifieur pour estimer la probabilité de match."""
+        self.ml_model = None
+        self.ml_metrics = {}
+
+        X, y = self._build_training_dataset(df_fo, df_bo)
+        if X is None or y is None:
+            return
+
+        # Le modèle ne peut pas apprendre sans au moins 2 classes.
+        if y.nunique() < 2:
+            return
+
+        stratify_target = y if y.value_counts().min() >= 2 else None
+        X_train, X_test, y_train, y_test = train_test_split(
+            X,
+            y,
+            test_size=0.25,
+            random_state=self.random_state,
+            stratify=stratify_target
+        )
+
+        model = Pipeline([
+            ('scaler', StandardScaler()),
+            ('clf', LogisticRegression(max_iter=500, class_weight='balanced', random_state=self.random_state))
+        ])
+        model.fit(X_train, y_train)
+
+        y_pred = model.predict(X_test)
+        y_prob = model.predict_proba(X_test)[:, 1]
+
+        metrics = {
+            'samples': int(len(X)),
+            'positive_rate': float(y.mean()),
+            'accuracy': float(accuracy_score(y_test, y_pred))
+        }
+        try:
+            metrics['roc_auc'] = float(roc_auc_score(y_test, y_prob))
+        except ValueError:
+            metrics['roc_auc'] = None
+
+        self.ml_model = model
+        self.ml_metrics = metrics
+
+    def _predict_match_probability(self, row_fo, row_bo, rule_score, detailed_scores):
+        if self.ml_model is None:
+            return None
+
+        features = self._build_feature_vector(row_fo, row_bo, rule_score, detailed_scores)
+        features_df = pd.DataFrame([features])
+        return float(self.ml_model.predict_proba(features_df)[0, 1])
+
+    def get_ml_training_metrics(self):
+        return self.ml_metrics
+
     def reconcile(self, df_fo, df_bo):
         """
         Tente de trouver le meilleur match dans le dataset du back-office pour chaque ligne du front-office.
         """
+        self.train_ml_matcher(df_fo, df_bo)
         results = []
         
         for _, row_fo in df_fo.iterrows():
             best_match_idx = -1
             max_score = -1
+            best_rule_score = 0.0
+            best_ml_prob = None
             best_detailed_scores = {}
 
             # On ne compare que les transactions avec le même ISIN
@@ -78,23 +214,36 @@ class ReconciliationEngine:
             
             if not potential_matches.empty:
                 for idx_bo, row_bo in potential_matches.iterrows():
-                    score, detailed = self.compute_row_score(row_fo, row_bo)
-                    if score > max_score:
-                        max_score = score
+                    rule_score, detailed = self.compute_row_score(row_fo, row_bo)
+                    ml_prob = self._predict_match_probability(row_fo, row_bo, rule_score, detailed)
+
+                    if ml_prob is None:
+                        final_score = rule_score
+                    else:
+                        final_score = ((1 - self.ml_weight) * rule_score) + (self.ml_weight * ml_prob)
+
+                    if final_score > max_score:
+                        max_score = final_score
                         best_match_idx = idx_bo
+                        best_rule_score = rule_score
+                        best_ml_prob = ml_prob
                         best_detailed_scores = detailed
             else:
                 # Cas où il y a des transactions manquantes
                 max_score = 0
+                best_rule_score = 0
+                best_ml_prob = None
 
             # Statut de la réconciliation
-            status = "MATCH" if max_score >= self.threshold else "UNMATCHED"
-            if max_score < 1.0 and max_score >= self.threshold:
+            status = "MATCH" if best_rule_score == 1.0 else "UNMATCHED"
+            if best_rule_score < 1.0 and max_score >= self.threshold:
                 status = "SUGGESTION"
 
             results.append({
                 'FO_Trade_ID': row_fo['Trade_ID'],
                 'BO_Index': best_match_idx,
+                'Rule_Score': round(best_rule_score, 4),
+                'ML_Probability': round(best_ml_prob, 4) if best_ml_prob is not None else np.nan,
                 'Global_Score': round(max_score, 4),
                 'Status': status,
                 'Break_Reason': self._get_break_reason(best_detailed_scores) if status != "MATCH" else ""

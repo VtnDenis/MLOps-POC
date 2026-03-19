@@ -4,15 +4,20 @@ from pathlib import Path
 from engine import ReconciliationEngine, AIReconciliationExplainer
 
 # Configuration de la page
-st.set_page_config(page_title="Amundi IA Reconciliation", layout="wide")
+st.set_page_config(page_title="PoC pour Amundi", layout="wide")
 
-st.title("🛡️ Plateforme de Réconciliation Automatisée (PoC)")
+st.title("Réconciliation automatisée")
 st.markdown("""
-Cette application utilise un moteur de matching probabiliste et l'IA Générative pour identifier et expliquer les écarts de réconciliation entre le Front-Office et le Back-Office.
+Cette application utilise un moteur de matching hybride (règles métiers + ML) et l'IA Générative pour identifier et expliquer les écarts de réconciliation entre le Front-Office et le Back-Office.
 """)
 
+# Paramètres moteur
+st.sidebar.header("⚙️ Paramètres de Réconciliation")
+threshold = st.sidebar.slider("Seuil de score global", min_value=0.60, max_value=0.99, value=0.85, step=0.01)
+ml_weight = st.sidebar.slider("Poids du score ML", min_value=0.00, max_value=0.70, value=0.35, step=0.05)
+
 # Initialisation des modules
-engine = ReconciliationEngine(threshold=0.85)
+engine = ReconciliationEngine(threshold=threshold, ml_weight=ml_weight)
 explainer = AIReconciliationExplainer()
 
 # --- Sidebar : Import des données ---
@@ -76,6 +81,7 @@ if df_fo is not None and df_bo is not None:
             st.session_state["recon_results"] = engine.reconcile(df_fo, df_bo)
             st.session_state["df_fo"] = df_fo
             st.session_state["df_bo"] = df_bo
+            st.session_state["ml_metrics"] = engine.get_ml_training_metrics()
 
     if "recon_results" in st.session_state:
         results = st.session_state["recon_results"]
@@ -87,12 +93,27 @@ if df_fo is not None and df_bo is not None:
         matches = len(results[results['Status'] == 'MATCH'])
         suggestions = len(results[results['Status'] == 'SUGGESTION'])
         unmatched = len(results[results['Status'] == 'UNMATCHED'])
+        avg_ml_prob = results['ML_Probability'].dropna().mean() if 'ML_Probability' in results.columns else None
 
         # --- Affichage des KPIs ---
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         col1.metric("Taux d'Auto-Match", f"{(matches/total):.1%}", delta=None)
         col2.metric("Suggestions IA", suggestions)
         col3.metric("Alertes (Unmatched)", unmatched)
+        col4.metric(
+            "Confiance ML moyenne",
+            f"{avg_ml_prob:.1%}" if avg_ml_prob is not None and not pd.isna(avg_ml_prob) else "N/A"
+        )
+
+        ml_metrics = st.session_state.get("ml_metrics", {})
+        if ml_metrics:
+            roc_auc = ml_metrics.get("roc_auc")
+            st.caption(
+                "Modèle ML entraîné sur "
+                f"{ml_metrics.get('samples', 0)} paires (positifs: {ml_metrics.get('positive_rate', 0):.1%}) | "
+                f"Accuracy: {ml_metrics.get('accuracy', 0):.2f}"
+                + (f" | ROC-AUC: {roc_auc:.2f}" if roc_auc is not None else "")
+            )
 
         # --- Table des résultats ---
         st.subheader("📋 Détail des opérations")
@@ -112,7 +133,7 @@ if df_fo is not None and df_bo is not None:
 
         # --- Focus sur une suggestion (Analyse IA) ---
         if suggestions > 0:
-            st.subheader("🤖 Analyse approfondie par l'IA")
+            st.subheader("Analyse détaillée avec l'IA")
             st.info("L'IA analyse ici les lignes en statut 'SUGGESTION' pour proposer une correction.")
 
             suggestions_df = results[results['Status'] == 'SUGGESTION'].copy()
