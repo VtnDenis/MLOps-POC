@@ -6,7 +6,7 @@ from datetime import timedelta
 def mock_data_generator(n_rows=1000):
     np.random.seed(42)
     
-    # 1. Création de la base "Front-Office" (La référence propre)
+    # CSV pour le front-office (version propre)
     data_fo = {
         'Trade_ID': [f"TRD_{i:04d}" for i in range(n_rows)],
         'ISIN': [f"FR{np.random.randint(100000, 999999)}00" for _ in range(n_rows)],
@@ -18,35 +18,32 @@ def mock_data_generator(n_rows=1000):
     }
     df_fo = pd.DataFrame(data_fo)
 
-    # 2. Création de la base "Back-Office" (La base avec erreurs à réconcilier)
+    # CSV pour le back-office (version avec des erreurs de frappes/synthaxes)
     df_bo = df_fo.copy()
 
-    # --- Simulation des anomalies métier (Réconciliation IA) ---
+    # Simulation des erreurs
     
-    # A. Erreurs de libellé (Fuzzy Matching)
+    # Erreurs de libellés
     typos = {'BNP Paribas': 'BNP PARIBAS SA', 'Societe Generale': 'SOCGEN', 'HSBC': 'HSBC LTD'}
     idx_typo = df_bo.sample(frac=0.1).index
     df_bo.loc[idx_typo, 'Counterparty'] = df_bo.loc[idx_typo, 'Counterparty'].map(lambda x: typos.get(x, x))
 
-    # B. Décalages de date (T+1 / T+2)
+    # Erreurs de dates
     idx_date = df_bo.sample(frac=0.15).index
     df_bo.loc[idx_date, 'Date'] = df_bo.loc[idx_date, 'Date'] + timedelta(days=1)
 
-    # C. Écarts de montant (Frais de courtage / Arrondis)
+    # Montants incohérents (centimes de décalage)
     idx_price = df_bo.sample(frac=0.1).index
     df_bo.loc[idx_price, 'Price'] = df_bo.loc[idx_price, 'Price'] + np.random.uniform(0.01, 0.05, len(idx_price))
 
-    # D. Ruptures de flux (Lignes manquantes ou en trop)
+    # Transactions en trop ou manquantes
     df_bo = df_bo.drop(df_bo.sample(frac=0.05).index) # Lignes perdues
     
-    # E. Supprimer les IDs pour forcer l'IA à matcher sur les autres colonnes
+    # On enlève l'ID pour entraîner le modèle
     df_bo = df_bo.drop(columns=['Trade_ID'])
     
     return df_fo, df_bo
 
-# Génération et sauvegarde
 df_front, df_back = mock_data_generator()
-df_front.to_csv('data_front_office.csv', index=False)
-df_back.to_csv('data_back_office.csv', index=False)
-
-print(f"Datasets générés : {len(df_front)} lignes FO, {len(df_back)} lignes BO.")
+df_front.to_csv('./dataset/data_front_office.csv', index=False)
+df_back.to_csv('./dataset/data_back_office.csv', index=False)
