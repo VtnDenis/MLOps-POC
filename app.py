@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 from engine import ReconciliationEngine, AIReconciliationExplainer
+from db import PostgresPersistence
 
 # Configuration de la page
 st.set_page_config(page_title="PoC pour Amundi", layout="wide")
@@ -19,6 +20,7 @@ ml_weight = st.sidebar.slider("Poids du score ML", min_value=0.00, max_value=0.7
 # Initialisation des modules
 engine = ReconciliationEngine(threshold=threshold, ml_weight=ml_weight)
 explainer = AIReconciliationExplainer()
+db_persistence = PostgresPersistence()
 
 # --- Sidebar : Import des données ---
 st.sidebar.header("📁 Chargement des Flux")
@@ -82,6 +84,33 @@ if df_fo is not None and df_bo is not None:
             st.session_state["df_fo"] = df_fo
             st.session_state["df_bo"] = df_bo
             st.session_state["ml_metrics"] = engine.get_ml_training_metrics()
+
+            # 2. Persistance PostgreSQL (optionnelle)
+            if db_persistence.enabled:
+                try:
+                    source_type = current_signature[0] if current_signature else "unknown"
+                    source_ref = None
+                    if current_signature:
+                        if source_type == "upload":
+                            source_ref = f"{current_signature[1]} | {current_signature[3]}"
+                        elif source_type == "local":
+                            source_ref = f"{current_signature[1]} | {current_signature[3]}"
+
+                    db_persistence.ensure_schema()
+                    run_id = db_persistence.save_run_and_results(
+                        results_df=st.session_state["recon_results"],
+                        threshold=threshold,
+                        ml_weight=ml_weight,
+                        source_type=source_type,
+                        source_ref=source_ref,
+                        ml_metrics=st.session_state.get("ml_metrics", {}),
+                    )
+                    st.session_state["db_run_id"] = run_id
+                    st.sidebar.success(f"Run sauvegardé en base (run_id: {run_id[:8]}...).")
+                except Exception as e:
+                    st.sidebar.warning(f"Réconciliation OK, mais persistance PostgreSQL échouée : {e}")
+            else:
+                st.sidebar.info("PostgreSQL non configuré : persistance désactivée.")
 
     if "recon_results" in st.session_state:
         results = st.session_state["recon_results"]
